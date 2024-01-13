@@ -1,4 +1,4 @@
-﻿#include <assert.h>
+#include <assert.h>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -207,7 +207,8 @@ private:
 #endif
 
 #define USE_STD_UMAP 0
-#define NOT_USE_SIMD 0
+// 1 is for AVX256
+#define USE_SIMD 2
 #define SINGLE_THREADED_AGG 0
 #define NOT_USE_MM_FILE 1
 
@@ -630,14 +631,35 @@ namespace sergz_1brc
 	};
 	struct parse_entry_state : reset_next_line_entry_data
 	{
+		enum class use_simd
+		{
+			no_simd, avx256, avx512
+		};
 		std::string_view place_name;
 		std::string carry_place_name;
+
 		template<typename Fn>
 		void parse_string(const char* data_begin, const char* data_end, Fn&& fn)
 		{
-			parse_string(data_begin, data_end, fn, data_begin);
+			switch (available_simd_method)
+			{
+			case use_simd::avx256:
+				parse_string_avx<use_simd::avx256>(data_begin, data_end, std::forward<Fn>(fn));
+				break;
+			case use_simd::avx512:
+				parse_string_avx<use_simd::avx512>(data_begin, data_end, std::forward<Fn>(fn));
+				break;
+			case use_simd::no_simd: [[fallthrough]];
+			default:
+				parse_string(data_begin, data_end, fn, data_begin);
+				break;
+			}
 		}
 
+		template<use_simd simd_method>
+		struct AVXSearch;
+
+	private:
 		template<typename Fn>
 		void parse_string(const char* data_begin, const char* data_end, Fn&& fn, const char* data)
 		{
@@ -711,44 +733,33 @@ namespace sergz_1brc
 			}
 		}
 
-		template<typename Fn>
-		void parse_string_simd(const char* data_begin, const char* data_end, Fn&& fn)
+		template<use_simd simd_method, typename Fn>
+		void parse_string_avx(const char* data_begin, const char* data_end, Fn&& fn)
 		{
-			__m256i semicolon = _mm256_set1_epi8(';');
-			__m256i newline = _mm256_set1_epi8('\n');
-
+			AVXSearch<simd_method> avx_code;
 			const char* data = data_begin;
-			while (true)
+			const char* data_end_simd = data_end - AVXSearch<simd_method>::data_step;
+			while (data < data_end_simd)
 			{
-				if (data >= data_end - 32)
-				{
-					parse_string(data_begin, data_end, fn, data);
-					break;
-				}
-				__m256i simd_data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
-				__m256i simd_cmp_semicolon = _mm256_cmpeq_epi8(simd_data, semicolon);
-				__m256i simd_cmp_newline = _mm256_cmpeq_epi8(simd_data, newline);
-
-				uint32_t mask_semicolon = _mm256_movemask_epi8(simd_cmp_semicolon);
-				uint32_t mask_newline = _mm256_movemask_epi8(simd_cmp_newline);
-				// let's begin with something stupid and simple
-				uint32_t mask_special_symbol = mask_semicolon | mask_newline;
+				auto mask_special_symbol = avx_code.load_and_cmp(data);
+				
 				const char* wdata = data;
 				while (mask_special_symbol != 0)
 				{
 #ifdef WIN32
 					int special_symbol_pos = std::countr_zero(mask_special_symbol);
 #else
-					int special_symbol_pos = __builtin_ctz(mask_special_symbol);
+					int special_symbol_pos = __builtin_ctzll(mask_special_symbol);
 #endif
 					const char* wdata_end = data + special_symbol_pos;
+
 					if (curr_field == field_type::place_name)
 					{
 						assert(*wdata_end == ';');
 						place_name = std::string_view(data_begin, wdata_end - data_begin);
 						curr_field = field_type::value_sign;
 						wdata = wdata_end + 1;
-						mask_special_symbol &= ~(1 << special_symbol_pos);
+						mask_special_symbol &= ~(typename AVXSearch<simd_method>::mask_type(1) << special_symbol_pos);
 						continue;
 					}
 					if (curr_field == field_type::value_sign)
@@ -787,7 +798,7 @@ namespace sergz_1brc
 						carry_place_name.resize(0);
 						wdata = wdata_end + 1;
 						data_begin = wdata;
-						mask_special_symbol &= ~(1 << special_symbol_pos);
+						mask_special_symbol &= ~(typename AVXSearch<simd_method>::mask_type(1) << special_symbol_pos);
 						continue;
 					}
 					
@@ -797,12 +808,12 @@ namespace sergz_1brc
 						carry_place_name.append(data_begin, wdata_end - data_begin);
 						curr_field = field_type::value_sign;
 						wdata = wdata_end + 1;
-						mask_special_symbol &= ~(1 << special_symbol_pos);
+						mask_special_symbol &= ~(typename AVXSearch<simd_method>::mask_type(1) << special_symbol_pos);
 						continue;
 					}
 				}
 
-				data += 32;
+				data += AVXSearch<simd_method>::data_step;
 				if (mask_special_symbol == 0 && wdata < data)
 				{
 					if (curr_field == field_type::value_sign)
@@ -832,8 +843,63 @@ namespace sergz_1brc
 					}
 				}
 			}
+			parse_string(data_begin, data_end, fn, data);
 		}
+
+		static const use_simd available_simd_method;
 	};
+		template<>
+		struct parse_entry_state::AVXSearch<parse_entry_state::use_simd::avx256>
+		{
+			static constexpr uint64_t data_step = 32;
+			__m256i semicolon = _mm256_set1_epi8(';');
+			__m256i newline = _mm256_set1_epi8('\n');
+            typedef uint32_t mask_type;
+			uint32_t load_and_cmp(const char* data)
+			{
+				__m256i simd_data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
+				__m256i simd_cmp_semicolon = _mm256_cmpeq_epi8(simd_data, semicolon);
+				__m256i simd_cmp_newline = _mm256_cmpeq_epi8(simd_data, newline);
+
+				uint32_t mask_semicolon = _mm256_movemask_epi8(simd_cmp_semicolon);
+				uint32_t mask_newline = _mm256_movemask_epi8(simd_cmp_newline);
+				// let's begin with something stupid and simple
+				return mask_semicolon | mask_newline;
+			}
+		};
+
+		template<>
+		struct parse_entry_state::AVXSearch<parse_entry_state::use_simd::avx512>
+		{
+			static constexpr uint64_t data_step = 64;
+			__m512i semicolon = _mm512_set1_epi8(';');
+			__m512i newline = _mm512_set1_epi8('\n');
+            typedef uint64_t mask_type;
+
+			uint64_t load_and_cmp(const char* data)
+			{
+				__m512i simd_data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(data));
+				__mmask64 mask_semicolon = _mm512_cmp_epu8_mask(simd_data, semicolon, _MM_CMPINT_EQ);
+				__mmask64 mask_newline = _mm512_cmp_epu8_mask(simd_data, newline, _MM_CMPINT_EQ);
+				// let's begin with something stupid and simple
+				return mask_semicolon | mask_newline;
+			}
+		};
+
+
+	const parse_entry_state::use_simd parse_entry_state::available_simd_method = []() {
+		// there is no simple method (check a couple of bits) of figuring out of what is supported, so hard code it
+		if constexpr (USE_SIMD == 2)
+		{
+			return use_simd::avx512;
+		}
+
+		if constexpr (USE_SIMD == 1)
+		{
+			return use_simd::avx256;
+		}
+		return use_simd::no_simd;
+	}();
 }
 
 static int my_main(int argc, char* argv[])
@@ -871,12 +937,7 @@ static int my_main(int argc, char* argv[])
 				auto data_size = input_file.gcount();
 				const char* data = buffer.data();
 				const char* data_end = buffer.data() + data_size;
-#if NOT_USE_SIMD
-				pes.parse_string
-#else
-				pes.parse_string_simd
-#endif
-				(data, data_end, [&pes, &input_file, &aggregates]()
+				pes.parse_string(data, data_end, [&pes, &input_file, &aggregates]()
 					{
 						if (pes.is_complete_line || input_file.eof())
 						{
@@ -914,12 +975,7 @@ static int my_main(int argc, char* argv[])
 				const auto& buffer = chunk.buffer;
 				const char* data = buffer.data();
 				parse_entry_state pes{};
-#if NOT_USE_SIMD
-				pes.parse_string
-#else
-				pes.parse_string_simd
-#endif
-					(data, data + buffer.size(), [&pes, &chunk_aggregates]()
+				pes.parse_string(data, data + buffer.size(), [&pes, &chunk_aggregates]()
 						{
 							if (pes.is_complete_line)
 							{
@@ -1020,12 +1076,7 @@ static int my_main(int argc, char* argv[])
 				const auto& buffer = chunk.buffer;
 				const char* data = buffer.data();
 				parse_entry_state pes{};
-#if NOT_USE_SIMD
-				pes.parse_string
-#else
-				pes.parse_string_simd
-#endif
-					(data, data + buffer.size(), [&pes, &chunk_aggregates]()
+				pes.parse_string(data, data + buffer.size(), [&pes, &chunk_aggregates]()
 						{
 							if (pes.is_complete_line)
 							{
@@ -1115,3 +1166,4 @@ int main(int argc, char* argv[])
 #endif
 	return rc;
 }
+
